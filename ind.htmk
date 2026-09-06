@@ -1,0 +1,1114 @@
+<script>
+  /* ============================================================
+     ANICADE - AniList + Zokoanime Integration
+     Uses AniList GraphQL for metadata, Zokoanime for streaming,
+     slug-based URLs with MAL ID for compatibility.
+     ============================================================ */
+
+  // --- Constants & State ---------------------------------------
+  const ANILIST_GRAPHQL = 'https://graphql.anilist.co';
+  const ZOKO_ORIGIN = 'https://zokoanime.video';
+  const PLACEHOLDER_COVER = 'https://placehold.co/300x400/0d1120/00d4ff?text=ANICADE';
+  const ANICADE_KEYS = {
+    progress: 'anicade_watch_progress',
+    prefs: 'anicade_user_preferences',
+    watchlist: 'anicade_watchlist'
+  };
+  const cache = new Map();
+  const state = {
+    route: 'home',
+    query: '',
+    genre: null,
+    letter: 'All',
+    page: 1,
+    track: 'sub',
+    episode: 1,
+    currentAnime: null,
+    loadingMore: false,
+    hasMore: true,
+    catalogIds: new Set(),
+    catalogRequestToken: 0,
+    infiniteObserver: null,
+    streamFallbacks: new Set(),
+    azCache: {},
+    watchdogTimer: null,
+    watchdogToken: 0,
+    heroItems: [],
+    heroIndex: 0,
+    heroTimer: null,
+    seasonYear: new Date().getFullYear(),
+    seasonName: currentSeason()
+  };
+
+  const sections = ['homePage', 'catalogPage', 'detailsPage', 'watchPage', 'newsPage'];
+  const genres = ['Action', 'Adventure', 'Comedy', 'Drama', 'Fantasy', 'Horror', 'Mystery', 'Romance', 'Sci-Fi', 'Slice of Life', 'Sports', 'Supernatural', 'Thriller'];
+  // Map genre names to AniList genre strings (lowercase, no spaces)
+  const ANILIST_GENRES = {
+    Action: 'Action',
+    Adventure: 'Adventure',
+    Comedy: 'Comedy',
+    Drama: 'Drama',
+    Fantasy: 'Fantasy',
+    Horror: 'Horror',
+    Mystery: 'Mystery',
+    Romance: 'Romance',
+    'Sci-Fi': 'Sci-Fi',
+    'Slice of Life': 'Slice of Life',
+    Sports: 'Sports',
+    Supernatural: 'Supernatural',
+    Thriller: 'Thriller'
+  };
+  const letters = ['All','0-9','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z'];
+  const seasonNames = ['winter', 'spring', 'summer', 'fall'];
+
+  // --- Helper Functions ----------------------------------------
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const strip = s => String(s || '').replace(/<[^>]+>/g,'').trim();
+  const validMalId = id => { const n = Number(id); return Number.isInteger(n) && n > 0 ? n : null; };
+  const validEpisode = ep => { const n = Number(ep); return Number.isInteger(n) && n > 0 ? n : null; };
+  const validTrack = t => t === 'sub' || t === 'dub' ? t : null;
+
+  function currentSeason() {
+    const m = new Date().getMonth() + 1;
+    return m <= 2 ? 'winter' : m <= 5 ? 'spring' : m <= 8 ? 'summer' : 'fall';
+  }
+
+  function dedupeAnime(items) {
+    const seen = new Set();
+    return items.filter(a => {
+      const key = a.malId ? `mal:${a.malId}` : `anilist:${a.aniListId}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function setPage(id) {
+    sections.forEach(s => $(s).classList.toggle('active', s === id));
+  }
+
+  function readJson(k, f) {
+    try { return JSON.parse(localStorage.getItem(k) || '') || f; } catch(e) { return f; }
+  }
+  function writeJson(k, v) { localStorage.setItem(k, JSON.stringify(v)); }
+
+  function showToast(msg) {
+    const t = document.createElement('div');
+    t.className = 'toast';
+    t.innerHTML = `<i class="fas fa-info-circle" style="color:var(--neon);margin-right:7px"></i>${esc(msg)}`;
+    $('toastContainer').appendChild(t);
+    setTimeout(() => t.remove(), 3300);
+  }
+
+  function setMeta(title, desc, img) {
+    document.title = title;
+    [
+      ['property','og:title',title],
+      ['property','og:description',desc],
+      ['property','og:image',img || 'https://i.imgur.com/qgZhkhV.jpeg'],
+      ['name','twitter:title',title],
+      ['name','twitter:description',desc],
+      ['name','description',desc]
+    ].forEach(([a,k,v]) => {
+      let el = document.querySelector(`meta[${a}="${k}"]`);
+      if (!el) { el = document.createElement('meta'); el.setAttribute(a,k); document.head.appendChild(el); }
+      el.content = v;
+    });
+  }
+
+  // --- AniList GraphQL Client ----------------------------------
+  const ANILIST_MEDIA = `
+    id
+    idMal
+    title { romaji english native }
+    coverImage { extraLarge large medium }
+    bannerImage
+    description(asHtml: false)
+    seasonYear
+    season
+    status
+    genres
+    format
+    episodes
+    averageScore
+    popularity
+    startDate { year month day }
+    nextAiringEpisode { airingAt episode timeUntilAiring }
+    studios { nodes { name } }
+    duration
+    source
+    relations { edges { relationType node { id idMal title { romaji english } type } } }
+  `;
+
+  async function aniListFetch(query, variables = {}, timeout = 15000) {
+    const key = 'anilist:' + JSON.stringify({ query, variables });
+    if (cache.has(key)) return cache.get(key);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+      const r = await fetch(ANILIST_GRAPHQL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ query, variables }),
+        signal: controller.signal
+      });
+      const json = await r.json();
+      if (!r.ok || json.errors) throw new Error('AniList data unavailable');
+      cache.set(key, json.data);
+      return json.data;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Normalize AniList Media object to common shape
+  function normalizeAniList(a) {
+    if (!a || !a.id) return null;
+    const malId = validMalId(a.idMal);
+    const title = {
+      english: a.title?.english || a.title?.romaji || 'Unknown',
+      romaji: a.title?.romaji || a.title?.english || 'Unknown',
+      native: a.title?.native || '',
+      synonyms: []
+    };
+    const score = a.averageScore ? Number((a.averageScore / 10).toFixed(1)) : null;
+    const start = a.startDate?.year ? Date.UTC(a.startDate.year, (a.startDate.month || 1) - 1, a.startDate.day || 1) / 1000 : null;
+    const derivedAiring = start && start > Math.floor(Date.now() / 1000) ? { airingAt: start, episode: 1, timeUntilAiring: start - Math.floor(Date.now() / 1000) } : null;
+    return {
+      id: malId || `anilist-${a.id}`,          // fallback if no MAL ID
+      malId,
+      aniListId: a.id,
+      title,
+      cover: a.coverImage?.extraLarge || a.coverImage?.large || a.bannerImage || PLACEHOLDER_COVER,
+      image: a.coverImage?.large || a.coverImage?.medium || '',
+      score,
+      format: a.format || a.type || '',
+      type: a.format || a.type || '',
+      episodes: a.episodes || (a.nextAiringEpisode?.episode ? a.nextAiringEpisode.episode - 1 : null),
+      genres: a.genres || [],
+      synopsis: a.description || '',
+      description: a.description || '',
+      status: a.status || '',
+      season: a.season || '',
+      year: a.seasonYear || a.startDate?.year || null,
+      nextAiringEpisode: a.nextAiringEpisode || derivedAiring,
+      aired: { from: a.startDate?.year ? `${a.startDate.year}-${String(a.startDate.month || 1).padStart(2, '0')}-${String(a.startDate.day || 1).padStart(2, '0')}` : '' },
+      studios: (a.studios?.nodes || []).map(s => s.name),
+      duration: a.duration || null,
+      source: a.source || null,
+      relations: (a.relations?.edges || []).map(e => ({ relationType: e.relationType, node: e.node }))
+    };
+  }
+
+  // --- AniList Query Helpers (for catalog sections) ------------
+  async function aniListPage({ sort = ['TRENDING_DESC'], status = null, season = null, seasonYear = null, search = null, genre = null, page = 1, perPage = 24 }) {
+    const query = `
+      query($page:Int,$perPage:Int,$sort:[MediaSort],$status:MediaStatus,$season:MediaSeason,$seasonYear:Int,$search:String,$genre:String) {
+        Page(page:$page, perPage:$perPage) {
+          pageInfo { hasNextPage }
+          media(type:ANIME, isAdult:false, sort:$sort, status:$status, season:$season, seasonYear:$seasonYear, search:$search, genre_in:[$genre]) {
+            ${ANILIST_MEDIA}
+          }
+        }
+      }
+    `;
+    const variables = { page, perPage, sort, status, season, seasonYear, search, genre: genre || null };
+    const data = await aniListFetch(query, variables);
+    return {
+      items: (data.Page?.media || []).map(normalizeAniList).filter(Boolean),
+      hasMore: !!data.Page?.pageInfo?.hasNextPage
+    };
+  }
+
+  async function aniListAiringPage(page = 1, perPage = 24) {
+    const now = Math.floor(Date.now() / 1000);
+    const query = `
+      query($page:Int,$perPage:Int,$airingAtGreater:Int,$airingAtLesser:Int) {
+        Page(page:$page, perPage:$perPage) {
+          pageInfo { hasNextPage }
+          airingSchedules(airingAt_greater:$airingAtGreater, airingAt_lesser:$airingAtLesser, sort:TIME_DESC) {
+            media { ${ANILIST_MEDIA} }
+          }
+        }
+      }
+    `;
+    const data = await aniListFetch(query, { page, perPage, airingAtGreater: now - 86400 * 14, airingAtLesser: now + 86400 * 2 });
+    return {
+      items: (data.Page?.airingSchedules || []).map(x => normalizeAniList(x.media)).filter(Boolean),
+      hasMore: !!data.Page?.pageInfo?.hasNextPage
+    };
+  }
+
+  // --- A-Z with Jikan (kept because AniList lacks letter filter) ---
+  const jikanTimestamps = [];
+  let jikanQueue = Promise.resolve();
+  function jikanThrottle() {
+    const turn = jikanQueue.then(async () => {
+      while (true) {
+        const now = Date.now();
+        while (jikanTimestamps.length && now - jikanTimestamps[0] > 60000) jikanTimestamps.shift();
+        if (jikanTimestamps.length >= 55) { await sleep(1100); continue; }
+        const recent = jikanTimestamps.filter(t => Date.now() - t < 1000);
+        if (recent.length >= 3) { await sleep(1000 - (Date.now() - recent[0]) + 30); continue; }
+        jikanTimestamps.push(Date.now());
+        return;
+      }
+    });
+    jikanQueue = turn.catch(() => {});
+    return turn;
+  }
+
+  async function requestJson(url, timeout = 13000) {
+    if (typeof fetch === 'function') {
+      const r = await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(timeout) });
+      return { status: r.status, ok: r.ok, json: await r.json() };
+    }
+    // fallback for old browsers
+    return await new Promise((resolve, reject) => {
+      const x = new XMLHttpRequest();
+      x.open('GET', url, true);
+      x.timeout = timeout;
+      x.setRequestHeader('Accept', 'application/json');
+      x.onload = () => { try { resolve({ status: x.status, ok: x.status >= 200 && x.status < 300, json: JSON.parse(x.responseText) }); } catch(e) { reject(e); } };
+      x.onerror = () => reject(new Error('Anime data unavailable'));
+      x.ontimeout = () => reject(new Error('Anime data timed out'));
+      x.send();
+    });
+  }
+
+  const malPending = new Map();
+  async function malFetch(path, timeout = 13000) {
+    if (cache.has(path)) return cache.get(path);
+    if (malPending.has(path)) return malPending.get(path);
+    const run = (async () => {
+      let lastErr = new Error('Anime data unavailable');
+      for (let i = 0; i < 4; i++) {
+        try {
+          await jikanThrottle();
+          const r = await requestJson('https://api.jikan.moe/v4' + path, timeout);
+          if (r.status === 429) { lastErr = new Error('Anime data is rate-limited right now. Please try again shortly.'); await sleep(900 * (i + 1)); continue; }
+          if (!r.ok) throw new Error('Anime data unavailable');
+          cache.set(path, r.json);
+          return r.json;
+        } catch(e) { lastErr = e; if (i === 3) break; await sleep(500 * (i + 1)); }
+      }
+      throw lastErr;
+    })();
+    malPending.set(path, run);
+    try { return await run; } finally { malPending.delete(path); }
+  }
+
+  function startsWithLetter(a, letter) {
+    const t = (a.title?.english || a.title?.romaji || '').trim().toUpperCase();
+    return letter === '0-9' ? /^[0-9]/.test(t) : t.startsWith(letter);
+  }
+
+  async function jikanAzPage(letter, page = 1, limit = 24) {
+    if (letter === 'All') return animePage(`/anime?order_by=title&sort=asc&page=${page}&limit=${limit}&sfw=true`);
+    const key = letter;
+    const needed = page * limit;
+    let store = state.azCache[key] || (state.azCache[key] = { items: [], seen: new Set(), nextPage: 1, exhausted: false, directPage: 1, directExhausted: false });
+    const add = items => items.filter(a => startsWithLetter(a, letter)).forEach(a => {
+      const malId = validMalId(a.malId || a.mal_id || a.id);
+      const k = `mal:${malId}`;
+      if (malId && !store.seen.has(k)) { store.seen.add(k); store.items.push(a); }
+    });
+    if (letter !== '0-9') {
+      while (store.items.length < needed && !store.directExhausted) {
+        try {
+          const direct = await animePage(`/anime?order_by=title&sort=asc&page=${store.directPage}&limit=25&sfw=true&letter=${encodeURIComponent(letter.toLowerCase())}`);
+          store.directPage++;
+          add(direct.items);
+          if (!direct.hasMore) store.directExhausted = true;
+        } catch(e) { store.directExhausted = true; }
+      }
+    }
+    let scans = 0;
+    const deadline = Date.now() + 6000;
+    while (store.items.length < needed && !store.exhausted && scans < 6 && Date.now() < deadline) {
+      const result = await animePage(`/anime?order_by=title&sort=asc&page=${store.nextPage}&limit=25&sfw=true`);
+      store.nextPage++;
+      scans++;
+      add(result.items);
+      if (!result.hasMore) store.exhausted = true;
+    }
+    return { items: store.items.slice((page - 1) * limit, needed), hasMore: !store.exhausted || store.items.length > needed };
+  }
+
+  // Old Jikan animePage (kept for A-Z only)
+  async function animePage(path) {
+    const d = await malFetch(path);
+    return { items: (d.data || []).map(x => normalizeJikan(x.entry || x)).filter(Boolean), hasMore: !!d.pagination?.has_next_page };
+  }
+
+  function normalizeJikan(a) {
+    const malId = validMalId(a?.mal_id);
+    if (!malId) return null;
+    const t = a.titles?.find(t => t.type === 'English')?.title || a.title_english || a.title;
+    return {
+      id: malId,
+      malId,
+      aniListId: null,
+      title: { english: t, romaji: a.title || t, native: a.title_japanese || '', synonyms: [] },
+      cover: a.images?.jpg?.large_image_url || a.images?.webp?.large_image_url || a.images?.jpg?.image_url || PLACEHOLDER_COVER,
+      image: a.images?.jpg?.image_url || a.images?.webp?.image_url || '',
+      score: a.score,
+      format: a.type || '',
+      episodes: a.episodes || null,
+      genres: (a.genres || []).map(g => g.name),
+      synopsis: a.synopsis || '',
+      status: a.status || '',
+      season: a.season || '',
+      year: a.year || null,
+      aired: a.aired || {},
+      studios: (a.studios || []).map(s => s.name),
+      relations: a.relations || [],
+      nextAiringEpisode: null
+    };
+  }
+
+  // --- Anime by ID (AniList via MAL ID) -------------------------
+  async function animeById(id) {
+    const malId = validMalId(id);
+    if (!malId) throw new Error('Invalid anime');
+    const query = `
+      query($idMal:Int) {
+        Media(idMal:$idMal, type:ANIME) {
+          ${ANILIST_MEDIA}
+        }
+      }
+    `;
+    const data = await aniListFetch(query, { idMal: malId });
+    const a = normalizeAniList(data.Media);
+    if (!a) throw new Error('Anime unavailable');
+    return a;
+  }
+
+  // --- Slug Generation & URL Helpers ----------------------------
+  function toSlug(title) {
+    return String(title || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+  }
+
+  function detailsHref(id) {
+    const malId = validMalId(id);
+    if (!malId) return '#/anime';
+    // We need the title to generate slug; but we might not have it yet. In links we'll use a generic fallback
+    // For now, we still use numeric ID, but we'll update when rendering cards with the actual title.
+    // The card/rankCard functions will call detailsHref with both ID and title.
+    return `#/anime/${malId}`;
+  }
+
+  // Override to include slug in links when title is known
+  function animeDetailsLink(a) {
+    const malId = validMalId(a.malId || a.mal_id || a.id);
+    if (!malId) return '#/anime';
+    const title = (a.title?.english || a.title?.romaji || 'anime');
+    const slug = toSlug(title) + '-' + malId;
+    return `#/anime/${slug}`;
+  }
+
+  function watchHref(id, ep = 1, track = state.track) {
+    const malId = validMalId(id);
+    if (!malId) return '#/anime';
+    const title = state.currentAnime?.title?.english || state.currentAnime?.title?.romaji || 'anime';
+    const slug = toSlug(title) + '-' + malId;
+    return `#/watch/${slug}?ep=${validEpisode(ep) || 1}&track=${validTrack(track) || 'sub'}`;
+  }
+
+  // Zokoanime stream URL using AniList ID
+  function zokoUrl(anilistId, ep, track) {
+    const id = Number(anilistId);
+    const episode = validEpisode(ep);
+    const source = validTrack(track) || 'sub';
+    return id && episode ? `${ZOKO_ORIGIN}/stream/ani/${id}/${episode}/${source}?color=35d5bf` : '';
+  }
+
+  // --- UI Components --------------------------------------------
+  function loading() {
+    return `<div class="state"><i class="fas fa-spinner fa-spin" style="display:block;font-size:28px;margin-bottom:12px;color:var(--neon)"></i>Loading...</div>`;
+  }
+  function empty(msg) { return `<div class="state">${esc(msg)}</div>`; }
+  function errorState(msg) {
+    return `<div class="state"><i class="fas fa-wifi-slash" style="display:block;font-size:28px;margin-bottom:12px;color:var(--border)"></i>${esc(msg)}</div>`;
+  }
+  function shell(num, title, sub, inner) {
+    return `<section class="section"><div class="section-header"><div class="section-title-wrap"><span class="section-num">${num}</span><h2 class="section-title">${title}</h2></div><span class="section-sub">${sub}</span></div>${inner}</section>`;
+  }
+
+  function countdownFromSeconds(t) {
+    if (!t || t < 0) return '';
+    const d = Math.floor(t / 86400), h = Math.floor(t % 86400 / 3600), m = Math.floor(t % 3600 / 60);
+    if (d >= 60) return `Releases in ${Math.floor(d / 30)} months`;
+    if (d >= 2) return `Releases in ${d} days`;
+    if (d) return `Releases in ${d}d ${h}h`;
+    if (h) return `Releases in ${h}h ${m}m`;
+    return `Releases in ${m}m`;
+  }
+  function countdownText(a) {
+    if (a.nextAiringEpisode?.timeUntilAiring) return countdownFromSeconds(a.nextAiringEpisode.timeUntilAiring);
+    const from = a.aired?.from ? Date.parse(a.aired.from) : NaN;
+    const seconds = Math.floor((from - Date.now()) / 1000);
+    return !isNaN(from) && seconds > 0 ? countdownFromSeconds(seconds) : '';
+  }
+
+  function card(a) {
+    const title = a.title?.english || a.title?.romaji || 'Unknown';
+    const airing = a.nextAiringEpisode?.airingAt || '';
+    const eps = countdownText(a) || (a.episodes ? `${a.episodes} EPS` : 'EPS TBA');
+    const malId = validMalId(a.malId || a.mal_id || a.id);
+    const link = animeDetailsLink(a);
+    const open = malId ? `onclick="location.hash='${link}'" tabindex="0" role="link"` : 'tabindex="0"';
+    return `<article class="anime-card" data-mal-id="${malId || ''}" data-anilist-id="${a.aniListId || ''}" ${open}>
+      <div class="poster">
+        <img src="${a.cover || a.image || PLACEHOLDER_COVER}" alt="${esc(title)}" loading="lazy" onerror="this.src='${PLACEHOLDER_COVER}'"/>
+        <div class="poster-shade"></div>
+        ${a.score ? `<span class="badge neon score"><i class="fas fa-star"></i>${a.score.toFixed(1)}</span>` : ''}
+        ${a.format ? `<span class="badge type">${esc(a.format)}</span>` : ''}
+        <div class="poster-info">
+          <h3 class="anime-title">${esc(title)}</h3>
+          <div class="anime-meta">${esc(a.status || 'Anime')} · <span ${airing ? `data-airing="${airing}"` : ''}>${esc(eps)}</span></div>
+        </div>
+      </div>
+    </article>`;
+  }
+
+  function rankCard(a, i) {
+    const title = a.title?.english || a.title?.romaji || 'Unknown';
+    const malId = validMalId(a.malId || a.mal_id || a.id);
+    const link = animeDetailsLink(a);
+    const open = malId ? `onclick="location.hash='${link}'"` : '';
+    return `<article class="rank-card" data-mal-id="${malId || ''}" data-anilist-id="${a.aniListId || ''}" ${open}>
+      <div class="rank-num">#${i}</div>
+      <img class="rank-cover" src="${a.cover || a.image || PLACEHOLDER_COVER}" alt="${esc(title)}" onerror="this.src='${PLACEHOLDER_COVER}'"/>
+      <div>
+        <div class="rank-title">${esc(title)}</div>
+        <div class="rank-stats">
+          ${a.score ? `<span class="badge neon"><i class="fas fa-star"></i>${a.score.toFixed(1)}</span>` : ''}
+          ${a.popularity ? `<span class="badge"><i class="fas fa-users"></i>${a.popularity.toLocaleString()}</span>` : ''}
+          ${a.episodes ? `<span class="badge">${a.episodes} EPS</span>` : ''}
+        </div>
+      </div>
+    </article>`;
+  }
+
+  function azSection() {
+    return shell('A-Z','A-Z <span>LIST</span>','All 0-9 A-Z',`<div class="az-strip">${letters.map(l => `<button onclick="location.hash='#/az?letter=${encodeURIComponent(l)}'">${l}</button>`).join('')}</div>`);
+  }
+
+  function seasonYearOptions() {
+    const current = new Date().getFullYear();
+    let html = '';
+    for (let y = current + 1; y >= 1970; y--) html += `<option value="${y}" ${state.seasonYear === y ? 'selected' : ''}>${y}</option>`;
+    return html;
+  }
+
+  function continueWatchingSection() {
+    const map = Object.values(readJson(ANICADE_KEYS.progress, {})).sort((a,b) => b.updatedAt - a.updatedAt).slice(0,6);
+    if (!map.length) return '';
+    return shell('CW','CONTINUE <span>WATCHING</span>','Saved locally, Firebase-ready',`<div class="wide-grid">${map.map(p => `<article class="rank-card" onclick="location.hash='${watchHref(p.malId, p.episode)}'"><div class="rank-num"><i class="fas fa-play"></i></div><div style="grid-column:span 2"><div class="rank-title">Saved Anime</div><div class="rank-stats"><span class="badge neon">EP ${p.episode}</span><span class="badge">${esc((p.track || 'sub').toUpperCase())}</span></div></div></article>`).join('')}</div>`);
+  }
+
+  // --- Hero Slider ----------------------------------------------
+  function heroSlideMarkup(a, i) {
+    const title = a.title.english || a.title.romaji;
+    const malId = validMalId(a.malId);
+    const watchLink = malId ? watchHref(malId, 1) : '#/anime';
+    const detailsLink = malId ? animeDetailsLink(a) : '#/anime';
+    return `<div class="hero-slide${i === 0 ? ' active' : ''}" data-index="${i}">
+      <img src="${a.cover || PLACEHOLDER_COVER}" alt="${esc(title)}" onerror="this.src='${PLACEHOLDER_COVER}'"/>
+      <div class="hero-slide-info">
+        <div class="badges">
+          ${a.format ? `<span class="badge neon">${esc(a.format)}</span>` : ''}
+          ${a.episodes ? `<span class="badge">${a.episodes} EPS</span>` : ''}
+          ${a.status ? `<span class="badge">${esc(a.status)}</span>` : ''}
+        </div>
+        <h2>${esc(title)}</h2>
+        <p>${esc(strip(a.synopsis) || 'No synopsis available.')}</p>
+        <div class="action-row">
+          <a class="btn-primary" href="${watchLink}"><i class="fas fa-play"></i> Watch Now</a>
+          <a class="btn-outline" href="${detailsLink}"><i class="fas fa-info-circle"></i> Details</a>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  function setHeroSlide(i) {
+    const el = $('heroSlider');
+    if (!el || !state.heroItems.length) return;
+    state.heroIndex = (i + state.heroItems.length) % state.heroItems.length;
+    el.querySelectorAll('.hero-slide').forEach((s, idx) => s.classList.toggle('active', idx === state.heroIndex));
+    el.querySelectorAll('.hero-dot').forEach((d, idx) => d.classList.toggle('active', idx === state.heroIndex));
+  }
+
+  window.heroSlide = delta => { setHeroSlide(state.heroIndex + delta); armHeroAutoplay(); };
+  window.setHeroSlideTo = i => { setHeroSlide(i); armHeroAutoplay(); };
+
+  function armHeroAutoplay() {
+    if (state.heroTimer) { clearInterval(state.heroTimer); state.heroTimer = null; }
+    if (state.heroItems.length > 1) state.heroTimer = setInterval(() => setHeroSlide(state.heroIndex + 1), 6000);
+  }
+
+  function renderHeroSlider(items) {
+    const el = $('heroSlider');
+    if (!el) return;
+    state.heroItems = (items || []).slice(0, 6);
+    if (!state.heroItems.length) { el.classList.add('skel'); return; }
+    state.heroIndex = 0;
+    el.classList.remove('skel');
+    el.innerHTML = state.heroItems.map(heroSlideMarkup).join('') + `<div class="hero-dots">${state.heroItems.map((_, i) => `<button class="hero-dot${i === 0 ? ' active' : ''}" onclick="setHeroSlideTo(${i})" aria-label="Slide ${i + 1}"></button>`).join('')}</div>`;
+    el.onmouseenter = () => { if (state.heroTimer) { clearInterval(state.heroTimer); state.heroTimer = null; } };
+    el.onmouseleave = () => armHeroAutoplay();
+    el.onclick = e => {
+      if (e.target.closest('a,button') || state.heroItems.length < 2) return;
+      const rect = el.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      if (x < rect.width * .25) heroSlide(-1); else if (x > rect.width * .75) heroSlide(1);
+    };
+    armHeroAutoplay();
+  }
+
+  // --- Home Page Render -----------------------------------------
+  async function renderHome() {
+    setPage('homePage');
+    setMeta('ANICADE - Anime Streaming Platform', 'Discover watchable anime on ANICADE.', 'https://i.imgur.com/qgZhkhV.jpeg');
+    $('homePage').innerHTML = `
+      <section class="hero">
+        <div class="hero-copy">
+          <div class="eyebrow">ANICADE anime platform</div>
+          <h1>ANIME WRLD <span>WARS</span></h1>
+          <p>Browse trending anime, new releases, rankings, recommendations, details, and watch-page foundations powered by canonical anime metadata.</p>
+          <div class="hero-actions">
+            <a class="btn-primary" href="#/anime"><i class="fas fa-play"></i> Browse Anime</a>
+            <a class="btn-outline" href="#/news"><i class="fas fa-newspaper"></i> Latest News</a>
+          </div>
+        </div>
+        <div class="hero-slider skel" id="heroSlider"></div>
+      </section>
+      ${shell('01','TRENDING <span>ANIME</span>','Watchable catalogue','<div class="carousel" id="homeTrending">'+loading()+'</div>')}
+      ${shell('02','NEW <span>RELEASES</span>','Now airing','<div class="grid" id="homeLatest">'+loading()+'</div>')}
+      ${shell('03','TOP <span>AIRING</span>','Live anime metadata','<div class="carousel" id="homeTop">'+loading()+'</div>')}
+      ${shell('04','MOST <span>POPULAR</span>','Fan favourites','<div class="grid" id="homePopular">'+loading()+'</div>')}
+      ${shell('05','LATEST <span>EPISODES</span>','Recent anime updates','<div class="grid" id="homeCompleted">'+loading()+'</div>')}
+      ${shell('06','UPCOMING <span>ANIME</span>','Future releases','<div class="carousel" id="homeUpcoming">'+loading()+'</div>')}
+      ${shell('07','RECENTLY <span>ADDED</span>','Newest catalogue entries','<div class="grid" id="homeRecent">'+loading()+'</div>')}
+      ${continueWatchingSection()}
+      ${azSection()}
+    `;
+
+    const fillAniList = async (id, promise, emptyMsg, after) => {
+      try {
+        const result = await promise;
+        const items = dedupeAnime(result.items || result);
+        $(id).innerHTML = items.map(card).join('') || empty(emptyMsg);
+        if (after) after(items);
+      } catch(e) {
+        $(id).innerHTML = errorState('Could not load this section.');
+      }
+    };
+
+    // Fetch all sections in parallel using AniList
+    await Promise.all([
+      fillAniList('homeTrending', aniListPage({ sort: ['TRENDING_DESC'], perPage: 12 }), 'No trending anime found.', items => renderHeroSlider(items)),
+      fillAniList('homeLatest', aniListPage({ status: 'RELEASING', sort: ['POPULARITY_DESC'], perPage: 18 }), 'No new releases found.'),
+      fillAniList('homeTop', aniListPage({ status: 'RELEASING', sort: ['SCORE_DESC'], perPage: 12 }), 'No top airing anime found.'),
+      fillAniList('homePopular', aniListPage({ sort: ['POPULARITY_DESC'], perPage: 18 }), 'No popular anime found.'),
+      fillAniList('homeCompleted', aniListAiringPage(1, 18), 'No latest episodes found.'),
+      fillAniList('homeUpcoming', aniListPage({ status: 'NOT_YET_RELEASED', sort: ['POPULARITY_DESC'], perPage: 18 }), 'No upcoming anime found.'),
+      fillAniList('homeRecent', aniListPage({ sort: ['START_DATE_DESC'], perPage: 18 }), 'No recently added anime found.')
+    ]);
+  }
+
+  // --- Catalog Page (Anime, Trending, Latest, etc.) -------------
+  async function renderCatalog(kind = 'anime') {
+    state.route = kind;
+    setPage('catalogPage');
+    resetCatalogState();
+    const prefs = getPrefs();
+    const titleMap = {
+      anime: 'ANIME <span>CATALOGUE</span>',
+      trending: 'TRENDING <span>ANIME</span>',
+      latest: 'LATEST <span>RELEASES</span>',
+      rankings: 'ANIME <span>RANKINGS</span>',
+      genres: 'GENRES <span>BROWSE</span>',
+      az: 'A-Z <span>ANIME</span>',
+      season: 'SEASONAL <span>ANIME</span>',
+      recently: 'RECENTLY <span>ADDED</span>',
+      upcoming: 'UPCOMING <span>ANIME</span>'
+    };
+    $('catalogPage').innerHTML = shell('AN', titleMap[kind] || titleMap.anime, 'Browse/search/filter anime', `
+      <form class="search-panel" id="catalogSearch">
+        <input id="catalogSearchInput" placeholder="Search anime by title..." value="${esc(state.query)}"/>
+        <button class="btn-primary"><i class="fas fa-search"></i> Search</button>
+      </form>
+      ${kind === 'genres' ? `<div class="filter-row">${genres.map(g => `<button class="chip-btn ${state.genre === g ? 'active' : ''}" onclick="setGenre('${esc(g)}')">${esc(g)}</button>`).join('')}</div>` : ''}
+      ${kind === 'az' ? `<div class="az-strip" style="margin-bottom:18px">${letters.map(l => `<button class="${state.letter === l ? 'active' : ''}" onclick="setLetter('${l}')">${l}</button>`).join('')}</div>` : ''}
+      ${kind === 'season' ? `<div class="filter-row" style="align-items:center;gap:10px"><select id="seasonYearSelect" onchange="setSeasonYear(this.value)">${seasonYearOptions()}</select>${seasonNames.map(s => `<button class="chip-btn ${state.seasonName === s ? 'active' : ''}" onclick="setSeasonName('${s}')">${s.toUpperCase()}</button>`).join('')}</div>` : ''}
+      <div class="catalog-options"><label class="pref-toggle"><input type="checkbox" id="infiniteScrollToggle" ${prefs.infiniteScroll ? 'checked' : ''}/> Infinite scroll</label></div>
+      <div class="${kind === 'rankings' ? 'wide-grid' : 'grid'}" id="catalogGrid">${loading()}</div>
+      <div id="catalogMoreState"></div>
+      <div class="action-row" id="loadMoreRow" style="justify-content:center;margin-top:22px"><button class="btn-outline" onclick="nextPage()"><i class="fas fa-plus"></i> Load More</button></div>
+      <div class="infinite-sentinel" id="catalogSentinel"></div>
+    `);
+    $('catalogSearch').addEventListener('submit', e => {
+      e.preventDefault();
+      state.query = $('catalogSearchInput').value.trim();
+      state.page = 1;
+      renderCatalog('anime');  // Always search within 'anime' catalog
+    });
+    $('infiniteScrollToggle').addEventListener('change', e => {
+      setPref('infiniteScroll', e.target.checked);
+      setupInfiniteScroll();
+    });
+    await loadCatalog(kind, false);
+    setupInfiniteScroll();
+  }
+
+  async function catalogPageData(kind) {
+    const q = (state.query || '').trim();
+    if (q) return aniListPage({ search: q, page: state.page, perPage: 24 });
+    if (kind === 'trending') return aniListPage({ sort: ['TRENDING_DESC'], page: state.page, perPage: 24 });
+    if (kind === 'latest') return aniListPage({ status: 'RELEASING', sort: ['POPULARITY_DESC'], page: state.page, perPage: 24 });
+    if (kind === 'rankings') return aniListPage({ sort: ['POPULARITY_DESC'], page: state.page, perPage: 24 });
+    if (kind === 'recently') return aniListPage({ sort: ['START_DATE_DESC'], page: state.page, perPage: 24 });
+    if (kind === 'upcoming') return aniListPage({ status: 'NOT_YET_RELEASED', sort: ['POPULARITY_DESC'], page: state.page, perPage: 24 });
+    if (kind === 'genres' && state.genre) {
+      const genre = ANILIST_GENRES[state.genre];
+      return genre ? aniListPage({ genre, sort: ['POPULARITY_DESC'], page: state.page, perPage: 24 }) : { items: [], hasMore: false };
+    }
+    if (kind === 'season') return aniListPage({ season: state.seasonName.toUpperCase(), seasonYear: state.seasonYear, sort: ['POPULARITY_DESC'], page: state.page, perPage: 24 });
+    if (kind === 'az') return jikanAzPage(state.letter || 'All', state.page, 24); // Jikan for A-Z
+    // Default: popular
+    return aniListPage({ sort: ['POPULARITY_DESC'], page: state.page, perPage: 24 });
+  }
+
+  async function loadCatalog(kind, append = false) {
+    const grid = $('catalogGrid');
+    const more = $('catalogMoreState');
+    if (state.loadingMore) return;
+    const token = ++state.catalogRequestToken;
+    state.loadingMore = true;
+    if (!append) { state.catalogIds = new Set(); grid.innerHTML = loading(); }
+    else more.innerHTML = loading();
+    try {
+      const page = state.page;
+      const result = await catalogPageData(kind);
+      if (token !== state.catalogRequestToken || kind !== state.route) return;
+      const fresh = dedupeAnime(result.items).filter(a => {
+        const key = a.malId ? `mal:${a.malId}` : `anilist:${a.aniListId}`;
+        if (state.catalogIds.has(key)) return false;
+        state.catalogIds.add(key);
+        return true;
+      });
+      state.hasMore = result.hasMore;
+      if (!append) grid.innerHTML = fresh.length ? fresh.map((a, i) => kind === 'rankings' ? rankCard(a, (page - 1) * 24 + i + 1) : card(a)).join('') : empty('No anime found. Try another search or filter.');
+      else if (fresh.length) grid.insertAdjacentHTML('beforeend', fresh.map((a, i) => kind === 'rankings' ? rankCard(a, (page - 1) * 24 + i + 1) : card(a)).join(''));
+      more.innerHTML = state.hasMore ? '' : empty('No more anime found.');
+      $('loadMoreRow').style.display = state.hasMore ? 'flex' : 'none';
+    } catch(e) {
+      if (token !== state.catalogRequestToken) return;
+      state.hasMore = false;
+      if (!append) grid.innerHTML = errorState('Anime data was slow or unavailable. Please try again.');
+      else more.innerHTML = errorState('Could not load more anime.');
+      $('loadMoreRow').style.display = 'none';
+    } finally {
+      if (token === state.catalogRequestToken) state.loadingMore = false;
+    }
+  }
+
+  function resetCatalogState() {
+    state.page = 1;
+    state.hasMore = true;
+    state.loadingMore = false;
+    state.catalogIds = new Set();
+    state.catalogRequestToken++;
+    if (state.infiniteObserver) { state.infiniteObserver.disconnect(); state.infiniteObserver = null; }
+    if (state.route === 'az') state.azCache = {};
+  }
+
+  function setupInfiniteScroll() {
+    if (state.infiniteObserver) { state.infiniteObserver.disconnect(); state.infiniteObserver = null; }
+    const prefs = getPrefs();
+    const sentinel = $('catalogSentinel');
+    const row = $('loadMoreRow');
+    if (row) row.style.display = state.hasMore ? 'flex' : 'none';
+    if (!prefs.infiniteScroll || !sentinel) return;
+    state.infiniteObserver = new IntersectionObserver(entries => {
+      if (entries.some(e => e.isIntersecting) && state.hasMore && !state.loadingMore) nextPage();
+    }, { rootMargin: '500px 0px' });
+    state.infiniteObserver.observe(sentinel);
+  }
+
+  window.setGenre = g => { state.genre = g; state.query = ''; state.page = 1; renderCatalog('genres'); };
+  window.setLetter = l => { state.letter = l; state.query = ''; state.page = 1; state.hasMore = true; state.loadingMore = false; state.catalogIds = new Set(); state.catalogRequestToken++; state.azCache = {}; renderCatalog('az'); };
+  window.setSeasonYear = y => { const year = Number(y); if (!year) return; state.seasonYear = year; state.query = ''; state.page = 1; renderCatalog('season'); };
+  window.setSeasonName = s => { if (!seasonNames.includes(s)) return; state.seasonName = s; state.query = ''; state.page = 1; renderCatalog('season'); };
+  window.nextPage = () => { if (state.loadingMore || !state.hasMore) return; state.page++; loadCatalog(state.route, !!getPrefs().infiniteScroll); };
+
+  // --- Details Page ---------------------------------------------
+  function infoGrid(a) {
+    const vals = [
+      ['Type', a.format],
+      ['Status', a.status],
+      ['Release date', a.aired?.from ? new Date(a.aired.from).toLocaleDateString() : 'Unknown'],
+      ['Studios', a.studios?.join(', ') || 'Unknown'],
+      ['Episodes', a.episodes || 'Unknown'],
+      ['Duration', a.duration || 'Unknown'],
+      ['Genres', a.genres?.join(', ') || 'Unknown'],
+      ['Source', a.source || 'Unknown'],
+      ['Score', a.score || 'Unscored'],
+    ];
+    return `<div class="info-grid">${vals.map(([l, v]) => `<div class="info-item"><div class="info-label">${esc(l)}</div><div class="info-value">${esc(v)}</div></div>`).join('')}</div>`;
+  }
+
+  function relatedCards(a) {
+    const rel = (a.relations || []).filter(r => r.node?.type === 'ANIME').slice(0, 10);
+    if (!rel.length) return empty('No related entries found.');
+    return rel.map(r => {
+      const node = r.node;
+      const malId = validMalId(node.idMal);
+      const title = node.title?.english || node.title?.romaji || 'Unknown';
+      const link = malId ? `#/anime/${toSlug(title)}-${malId}` : '#/anime';
+      return `<article class="rank-card" onclick="location.hash='${link}'">
+        <div class="rank-num"><i class="fas fa-link"></i></div>
+        <div style="grid-column:span 2">
+          <div class="rank-title">${esc(title)}</div>
+          <div class="rank-stats"><span class="badge neon">${esc(r.relationType.replace(/_/g, ' '))}</span></div>
+        </div>
+      </article>`;
+    }).join('');
+  }
+
+  async function renderDetails(id) {
+    setPage('detailsPage');
+    $('detailsPage').innerHTML = loading();
+    try {
+      // id may be a slug like "your-lie-in-april-23273" or just "23273"
+      const malId = extractMalIdFromSlug(id);
+      const a = await animeById(malId);
+      state.currentAnime = a;
+      const title = a.title.english || a.title.romaji;
+      setMeta(`${title} - ANICADE`, strip(a.synopsis).slice(0, 160) || 'Anime details on ANICADE.', a.cover);
+      $('detailsPage').innerHTML = `
+        <section class="detail-hero">
+          <div class="detail-bg" style="background-image:url('${a.cover || PLACEHOLDER_COVER}')"></div>
+          <div class="detail-poster"><img src="${a.cover || PLACEHOLDER_COVER}" alt="${esc(title)}" onerror="this.src='${PLACEHOLDER_COVER}'"/></div>
+          <div class="detail-main">
+            <div class="eyebrow">Anime details</div>
+            <h1>${esc(title)}</h1>
+            ${a.title.native ? `<div class="alt-title">${esc(a.title.native)}</div>` : ''}
+            <div class="badges">
+              ${[a.format, a.status, a.episodes ? `${a.episodes} episodes` : null, a.season && a.year ? `${a.season} ${a.year}` : a.year, a.score ? `Score: ${a.score}` : null].filter(Boolean).map(x => `<span class="badge neon">${esc(x)}</span>`).join('')}
+            </div>
+            <p class="synopsis">${esc(strip(a.synopsis) || 'No synopsis available.')}</p>
+            <div class="action-row">
+              <a class="btn-primary" href="${watchHref(malId, 1)}"><i class="fas fa-play"></i> Watch Now</a>
+              <button class="btn-outline" onclick="toggleWatchlist(${malId})"><i class="fas fa-bookmark"></i> Watchlist</button>
+            </div>
+          </div>
+        </section>
+        ${shell('INFO','SERIES <span>INFO</span>','Anime metadata', infoGrid(a))}
+        ${shell('SEASONS','SEASONS <span>& RELATED</span>','Related entries', `<div class="wide-grid">${relatedCards(a)}</div>`)}
+        ${shell('REC','RECOMMENDED <span>ANIME</span>','Related picks', `<div class="grid" id="recommendGrid">${loading()}</div>`)}
+        ${azSection()}
+      `;
+      loadRecommendations(malId, 'recommendGrid');
+    } catch(e) {
+      $('detailsPage').innerHTML = shell('ERR','ANIME <span>UNAVAILABLE</span>','Could not load details', errorState('This anime could not be loaded. Check the anime link and try again.'));
+    }
+  }
+
+  // Extract MAL ID from slug or plain ID
+  function extractMalIdFromSlug(slugOrId) {
+    const match = String(slugOrId).match(/(\d+)$/);
+    return match ? validMalId(match[1]) : validMalId(slugOrId);
+  }
+
+  async function loadRecommendations(malId, target) {
+    // Use AniList relations as recommendations
+    try {
+      const a = await animeById(malId);
+      const recs = (a.relations || []).filter(r => r.node?.type === 'ANIME').map(r => normalizeAniList(r.node)).filter(Boolean).slice(0, 10);
+      $(target).innerHTML = recs.length ? recs.map(card).join('') : empty('No recommendations available.');
+    } catch(e) {
+      $(target).innerHTML = errorState('Could not load recommendations.');
+    }
+  }
+
+  // --- Watch Page ----------------------------------------------
+  function episodeButtons(a) {
+    const count = validEpisode(a.episodes) || 12; // fallback to 12 if unknown
+    let html = '';
+    for (let i = 1; i <= Math.min(count, 200); i++) html += `<button class="episode-btn ${i === state.episode ? 'active' : ''}" onclick="setEpisode(${i})">${i}</button>`;
+    return html;
+  }
+
+  async function renderWatch(id) {
+    setPage('watchPage');
+    $('watchPage').innerHTML = loading();
+    try {
+      const malId = extractMalIdFromSlug(id);
+      const a = await animeById(malId);
+      state.currentAnime = a;
+      const p = new URLSearchParams(location.hash.split('?')[1] || '');
+      const prefs = getPrefs();
+      const maxEp = validEpisode(a.episodes);
+      state.episode = validEpisode(p.get('ep')) || 1;
+      if (maxEp && state.episode > maxEp) state.episode = maxEp;
+      state.track = validTrack(p.get('track')) || validTrack(prefs.track) || 'sub';
+      prefs.track = state.track;
+      writeJson(ANICADE_KEYS.prefs, prefs);
+      const title = a.title.english || a.title.romaji;
+      const anilistId = a.aniListId;
+      if (!anilistId) throw new Error('AniList ID missing');
+      const src = zokoUrl(anilistId, state.episode, state.track);
+      if (!src) throw new Error('Invalid stream URL');
+      setMeta(`Watch ${title} - ANICADE`, `Watch ${title} episode ${state.episode} on ANICADE.`, a.cover);
+      $('watchPage').innerHTML = `
+        ${shell('WATCH', `WATCH <span>${esc(title)}</span>`, 'Anime ANICADE streaming', `
+          <div class="watch-layout">
+            <div>
+              <div class="player-box"><iframe id="anime-player" src="${src}" width="100%" height="500" allow="fullscreen; autoplay" allowfullscreen referrerpolicy="no-referrer-when-downgrade" title="${esc(title)} episode ${state.episode} ${state.track}"></iframe></div>
+              <div id="playerMessage" class="player-message">Episode ${state.episode} · ${state.track.toUpperCase()}</div>
+              <div class="action-row" style="margin-top:12px">
+                <button class="btn-outline" onclick="saveProgress(${malId}, state.episode, {started:true})"><i class="fas fa-clock"></i> Save Progress</button>
+                <a class="btn-outline" href="${animeDetailsLink(a)}"><i class="fas fa-info-circle"></i> Anime Details</a>
+              </div>
+            </div>
+            <aside class="episode-panel">
+              <h2 class="section-title" style="font-size:24px">Episodes</h2>
+              <div class="track-toggle">
+                <button class="chip-btn ${state.track === 'dub' ? 'active' : ''}" onclick="setTrack('dub')">DUB</button>
+                <button class="chip-btn ${state.track === 'sub' ? 'active' : ''}" onclick="setTrack('sub')">SUB</button>
+              </div>
+              <label class="anime-meta"><input type="checkbox" ${prefs.autoplay ? 'checked' : ''} onchange="setPref('autoplay', this.checked)"/> Autoplay</label><br/>
+              <label class="anime-meta"><input type="checkbox" ${prefs.autoNext ? 'checked' : ''} onchange="setPref('autoNext', this.checked)"/> Auto-next</label><br/>
+              <label class="anime-meta"><input type="checkbox" ${prefs.autoSkipIntro ? 'checked' : ''} onchange="setPref('autoSkipIntro', this.checked)"/> Auto-skip intro</label>
+              <div class="episode-list">${episodeButtons(a)}</div>
+            </aside>
+          </div>
+        `)}
+        ${shell('ABOUT','ANIME <span>INFO</span>','Below the player', infoGrid(a))}
+        ${shell('REC','RELATED <span>ANIME</span>','Recommendations', `<div class="grid" id="watchRecs">${loading()}</div>`)}
+        ${azSection()}
+      `;
+      loadRecommendations(malId, 'watchRecs');
+      armWatchdog();
+    } catch(e) {
+      $('watchPage').innerHTML = shell('ERR','WATCH <span>UNAVAILABLE</span>','Could not load watch page', errorState('This watch page could not be opened.'));
+    }
+  }
+
+  // --- Player Controls (best effort) ----------------------------
+  function streamKey(id = state.currentAnime?.malId, ep = state.episode) {
+    const malId = validMalId(id);
+    return malId && ep ? `${malId}:${ep}` : '';
+  }
+  function markStreamUi(track = state.track) {
+    document.querySelectorAll('.episode-btn').forEach((b, i) => b.classList.toggle('active', i + 1 === state.episode));
+    document.querySelectorAll('.track-toggle .chip-btn').forEach(b => b.classList.toggle('active', b.textContent.trim().toLowerCase() === track));
+  }
+  function updateAnimePlayer() {
+    const id = state.currentAnime?.aniListId;
+    const ep = validEpisode(state.episode);
+    const track = validTrack(state.track);
+    if (!id || !ep || !track) return;
+    const player = $('anime-player');
+    const src = zokoUrl(id, ep, track);
+    if (player && src) player.src = src;
+    markStreamUi(track);
+    playerMessage(`Episode ${ep} · ${track.toUpperCase()}`);
+    history.replaceState(null, '', watchHref(state.currentAnime.malId, ep, track));
+    armWatchdog();
+  }
+  function fallbackToSub() {
+    const key = streamKey();
+    if (state.track !== 'dub' || !key || state.streamFallbacks.has(key)) return false;
+    state.streamFallbacks.add(key);
+    state.track = 'sub';
+    const prefs = getPrefs();
+    prefs.track = 'sub';
+    writeJson(ANICADE_KEYS.prefs, prefs);
+    updateAnimePlayer();
+    playerMessage(`DUB unavailable for episode ${state.episode}. Trying SUB...`);
+    return true;
+  }
+  function disarmWatchdog() {
+    if (state.watchdogTimer) { clearTimeout(state.watchdogTimer); state.watchdogTimer = null; }
+    state.watchdogToken++;
+  }
+  function armWatchdog() {
+    disarmWatchdog();
+    if (state.track !== 'dub') return;
+    const key = streamKey();
+    const token = state.watchdogToken;
+    state.watchdogTimer = setTimeout(() => {
+      if (token !== state.watchdogToken || streamKey() !== key) return;
+      if (!fallbackToSub()) playerMessage('Anime unavailable for this episode in DUB or SUB', true);
+    }, 22000);
+  }
+  window.setEpisode = ep => {
+    const n = validEpisode(ep);
+    if (!n || !state.currentAnime) return;
+    const max = validEpisode(state.currentAnime.episodes);
+    state.episode = max && n > max ? max : n;
+    state.streamFallbacks.delete(streamKey());
+    updateAnimePlayer();
+  };
+  window.setTrack = t => {
+    const track = validTrack(t);
+    if (!track || !state.currentAnime) return;
+    state.track = track;
+    if (track === 'dub') state.streamFallbacks.delete(streamKey());
+    setPref('track', track);
+    updateAnimePlayer();
+  };
+  window.toggleWatchlist = id => {
+    const malId = validMalId(id);
+    const list = readJson(ANICADE_KEYS.watchlist, []);
+    const exists = list.includes(malId);
+    const next = exists ? list.filter(x => x !== malId) : [malId, ...list];
+    if (!malId) return;
+    writeJson(ANICADE_KEYS.watchlist, next);
+    showToast(exists ? 'Removed from watchlist' : 'Added to watchlist');
+  };
+  function playerMessage(msg, error = false) {
+    const el = $('playerMessage');
+    if (el) { el.textContent = msg; el.classList.toggle('error', error); }
+  }
+  function saveProgress(malId, episode, patch = {}) {
+    const id = validMalId(malId);
+    const ep = validEpisode(episode);
+    if (!id || !ep) return;
+    const map = readJson(ANICADE_KEYS.progress, {});
+    map[`${id}:${ep}`] = { malId: id, episode: ep, track: state.track, updatedAt: Date.now(), ...patch };
+    writeJson(ANICADE_KEYS.progress, map);
+    if (!patch.silent) showToast('Progress saved');
+  }
+
+  // Listen for messages from Zokoanime iframe (if any)
+  window.addEventListener('message', event => {
+    if (event.origin !== ZOKO_ORIGIN) return;
+    const data = event.data && typeof event.data === 'object' ? event.data : {};
+    const type = data.type;
+    const payload = data.payload || {};
+    const malId = validMalId(state.currentAnime?.malId);
+    disarmWatchdog();
+    if (type === 'progress') {
+      saveProgress(malId, state.episode, { currentTime: payload.currentTime || 0, duration: payload.duration || 0, silent: true });
+      playerMessage(`Episode ${state.episode} · ${state.track.toUpperCase()} · Progress saved`);
+    } else if (type === 'complete') {
+      saveProgress(malId, state.episode, { complete: true, currentTime: payload.duration || payload.currentTime || 0, duration: payload.duration || 0, silent: true });
+      playerMessage('Episode complete');
+    } else if (type === 'error') {
+      if (fallbackToSub()) return;
+      playerMessage('Anime unavailable for this episode in DUB or SUB', true);
+    }
+  });
+
+  // --- News Page ------------------------------------------------
+  async function renderNews() {
+    setPage('newsPage');
+    $('newsPage').innerHTML = shell('NEWS','ANIME <span>NEWS</span>','Latest airing updates, powered by AniList', `<div class="news-grid" id="newsGrid">${loading()}</div>`);
+    try {
+      const [airing, trending] = await Promise.all([
+        aniListAiringPage(1, 12).catch(() => ({ items: [] })),
+        aniListPage({ sort: ['TRENDING_DESC'], status: 'RELEASING', perPage: 12 }).catch(() => ({ items: [] }))
+      ]);
+      const seen = new Set();
+      const items = [];
+      [...airing.items, ...trending.items].forEach(a => {
+        const key = a.aniListId || a.malId;
+        if (!a || !key || seen.has(key)) return;
+        seen.add(key);
+        items.push(a);
+      });
+      $('newsGrid').innerHTML = items.length ? items.slice(0, 12).map(newsCard).join('') : empty('No anime updates are available right now.');
+    } catch(e) {
+      $('newsGrid').innerHTML = errorState('Could not load news.');
+    }
+  }
+
+  function newsCard(a) {
+    const title = a.title.english || a.title.romaji;
+    const ep = a.nextAiringEpisode?.episode;
+    const when = a.nextAiringEpisode?.airingAt ? new Date(a.nextAiringEpisode.airingAt * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : null;
+    const headline = ep ? `Episode ${ep}${when ? ` airing ${when}` : ' airing soon'}` : (a.status ? a.status.replace(/_/g, ' ') : 'Update');
+    const excerpt = strip(a.synopsis).slice(0, 150) || 'No synopsis available.';
+    return `<article class="news-card">
+      <img src="${a.cover || PLACEHOLDER_COVER}" alt="" onerror="this.src='${PLACEHOLDER_COVER}'"/>
+      <div class="news-body">
+        <div class="news-source">AniList Update</div>
+        <h3 class="news-title">${esc(title)}</h3>
+        <p class="news-excerpt"><strong>${esc(headline)}</strong> · ${esc(excerpt)}</p>
+        <div class="action-row" style="margin-top:12px">${a.malId ? `<a class="btn-outline" href="${animeDetailsLink(a)}"><i class="fas fa-info-circle"></i> Anime Details</a>` : ''}</div>
+      </div>
+    </article>`;
+  }
+
+  // --- Router ------------------------------------------------
+  function route() {
+    const raw = location.hash.replace(/^#/, '') || '/';
+    const [path, qs = ''] = raw.split('?');
+    const p = new URLSearchParams(qs);
+    state.query = p.get('q') || '';
+    document.querySelectorAll('[data-nav]').forEach(a => a.classList.remove('active'));
+    let m;
+    if (path === '/' || path === '/home') {
+      state.route = 'home';
+      document.querySelector('[data-nav=home]')?.classList.add('active');
+      renderHome();
+    } else if ((m = path.match(/^\/anime\/(.+)/))) {
+      state.route = 'details';
+      renderDetails(decodeURIComponent(m[1])); // may be slug or ID
+    } else if ((m = path.match(/^\/watch\/(.+)/))) {
+      state.route = 'watch';
+      renderWatch(decodeURIComponent(m[1]));
+    } else if (path === '/news') {
+      state.route = 'news';
+      document.querySelector('[data-nav=news]')?.classList.add('active');
+      renderNews();
+    } else {
+      state.route = path.replace('/', '') || 'anime';
+      document.querySelector(`[data-nav=${state.route}]`)?.classList.add('active');
+      if (state.route === 'az') state.letter = p.get('letter') || 'All';
+      renderCatalog(state.route);
+    }
+    $('navLinks').classList.remove('open');
+  }
+
+  // --- Initialization -----------------------------------------
+  function refreshCountdowns() {
+    document.querySelectorAll('[data-airing]').forEach(el => {
+      const seconds = Number(el.dataset.airing) - Math.floor(Date.now() / 1000);
+      const text = countdownFromSeconds(seconds);
+      if (text) el.textContent = text;
+    });
+  }
+
+  // Theme & menu
+  $('themeToggle').addEventListener('click', () => {
+    const light = !document.body.classList.contains('light');
+    document.body.classList.toggle('light', light);
+    localStorage.setItem('anicade_theme', light ? 'light' : 'dark');
+    $('themeToggle').querySelector('i').className = light ? 'fas fa-sun' : 'fas fa-moon';
+  });
+  $('menuToggle').addEventListener('click', () => $('navLinks').classList.toggle('open'));
+  $('topSearchForm').addEventListener('submit', e => {
+    e.preventDefault();
+    const q = $('topSearchInput').value.trim();
+    if (q) location.hash = `#/anime?q=${encodeURIComponent(q)}`;
+  });
+  if (localStorage.getItem('anicade_theme') === 'light') document.body.classList.add('light');
+  window.addEventListener('hashchange', route);
+  setInterval(refreshCountdowns, 60000);
+  route();
+
+  // Service worker (if present)
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  </script>
