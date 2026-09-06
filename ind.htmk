@@ -1,10 +1,11 @@
 <script>
   /* ============================================================
-     ANICADE - AniList + Zokoanime Integration (Final)
+     ANICADE - Hybrid AniList + Jikan + Zokoanime (Final)
      ============================================================ */
 
   // --- Constants & State ---------------------------------------
   const ANILIST_GRAPHQL = 'https://graphql.anilist.co';
+  const JIKAN_API = 'https://api.jikan.moe/v4';
   const ZOKO_ORIGIN = 'https://zokoanime.video';
   const PLACEHOLDER_COVER = 'https://placehold.co/300x400/0d1120/00d4ff?text=ANICADE';
   const ANICADE_KEYS = {
@@ -55,6 +56,7 @@
     Supernatural: 'Supernatural',
     Thriller: 'Thriller'
   };
+  const GENRE_IDS = { Action:1, Adventure:2, Comedy:4, Drama:8, Fantasy:10, Horror:14, Mystery:7, Romance:22, 'Sci-Fi':24, 'Slice of Life':36, Sports:30, Supernatural:37, Thriller:41 };
   const letters = ['All','0-9','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z'];
   const seasonNames = ['winter', 'spring', 'summer', 'fall'];
 
@@ -112,7 +114,7 @@
     });
   }
 
-  // --- AniList GraphQL Client ----------------------------------
+  // --- AniList Client ------------------------------------------
   const ANILIST_MEDIA = `
     id
     idMal
@@ -133,7 +135,7 @@
     studios { nodes { name } }
     duration
     source
-    relations { edges { relationType node { id idMal title { romaji english } type } } }
+    relations { edges { relationType node { id idMal title { romaji english } type coverImage { large } } } }
   `;
 
   async function aniListFetch(query, variables = {}, timeout = 15000) {
@@ -236,7 +238,7 @@
     };
   }
 
-  // --- Jikan for A-Z (unchanged) -------------------------------
+  // --- Jikan Client ---------------------------------------------
   const jikanTimestamps = [];
   let jikanQueue = Promise.resolve();
   function jikanThrottle() {
@@ -272,16 +274,16 @@
     });
   }
 
-  const malPending = new Map();
-  async function malFetch(path, timeout = 13000) {
+  const jikanPending = new Map();
+  async function jikanFetch(path, timeout = 13000) {
     if (cache.has(path)) return cache.get(path);
-    if (malPending.has(path)) return malPending.get(path);
+    if (jikanPending.has(path)) return jikanPending.get(path);
     const run = (async () => {
       let lastErr = new Error('Anime data unavailable');
       for (let i = 0; i < 4; i++) {
         try {
           await jikanThrottle();
-          const r = await requestJson('https://api.jikan.moe/v4' + path, timeout);
+          const r = await requestJson(JIKAN_API + path, timeout);
           if (r.status === 429) { lastErr = new Error('Anime data is rate-limited right now. Please try again shortly.'); await sleep(900 * (i + 1)); continue; }
           if (!r.ok) throw new Error('Anime data unavailable');
           cache.set(path, r.json);
@@ -290,18 +292,8 @@
       }
       throw lastErr;
     })();
-    malPending.set(path, run);
-    try { return await run; } finally { malPending.delete(path); }
-  }
-
-  function startsWithLetter(a, letter) {
-    const t = (a.title?.english || a.title?.romaji || '').trim().toUpperCase();
-    return letter === '0-9' ? /^[0-9]/.test(t) : t.startsWith(letter);
-  }
-
-  async function animePage(path) {
-    const d = await malFetch(path);
-    return { items: (d.data || []).map(x => normalizeJikan(x.entry || x)).filter(Boolean), hasMore: !!d.pagination?.has_next_page };
+    jikanPending.set(path, run);
+    try { return await run; } finally { jikanPending.delete(path); }
   }
 
   function normalizeJikan(a) {
@@ -330,39 +322,33 @@
     };
   }
 
-  async function jikanAzPage(letter, page = 1, limit = 24) {
-    if (letter === 'All') return animePage(`/anime?order_by=title&sort=asc&page=${page}&limit=${limit}&sfw=true`);
-    const key = letter;
-    const needed = page * limit;
-    let store = state.azCache[key] || (state.azCache[key] = { items: [], seen: new Set(), nextPage: 1, exhausted: false, directPage: 1, directExhausted: false });
-    const add = items => items.filter(a => startsWithLetter(a, letter)).forEach(a => {
-      const malId = validMalId(a.malId || a.mal_id || a.id);
-      const k = `mal:${malId}`;
-      if (malId && !store.seen.has(k)) { store.seen.add(k); store.items.push(a); }
-    });
-    if (letter !== '0-9') {
-      while (store.items.length < needed && !store.directExhausted) {
-        try {
-          const direct = await animePage(`/anime?order_by=title&sort=asc&page=${store.directPage}&limit=25&sfw=true&letter=${encodeURIComponent(letter.toLowerCase())}`);
-          store.directPage++;
-          add(direct.items);
-          if (!direct.hasMore) store.directExhausted = true;
-        } catch(e) { store.directExhausted = true; }
-      }
-    }
-    let scans = 0;
-    const deadline = Date.now() + 6000;
-    while (store.items.length < needed && !store.exhausted && scans < 6 && Date.now() < deadline) {
-      const result = await animePage(`/anime?order_by=title&sort=asc&page=${store.nextPage}&limit=25&sfw=true`);
-      store.nextPage++;
-      scans++;
-      add(result.items);
-      if (!result.hasMore) store.exhausted = true;
-    }
-    return { items: store.items.slice((page - 1) * limit, needed), hasMore: !store.exhausted || store.items.length > needed };
+  async function jikanPage(path) {
+    const d = await jikanFetch(path);
+    return { items: (d.data || []).map(x => normalizeJikan(x.entry || x)).filter(Boolean), hasMore: !!d.pagination?.has_next_page };
   }
 
-  // --- Anime by ID (supports MAL or AniList) --------------------
+  async function jikanSearch(q, page = 1) {
+    const term = (q || '').trim();
+    if (!term) return { items: [], hasMore: false };
+    return jikanPage(`/anime?q=${encodeURIComponent(term)}&page=${page}&limit=24&sfw=true`);
+  }
+
+  async function jikanGenres(genre, page = 1) {
+    const gid = GENRE_IDS[genre];
+    if (!gid) return { items: [], hasMore: false };
+    return jikanPage(`/anime?genres=${gid}&order_by=popularity&sort=asc&page=${page}&limit=24&sfw=true`);
+  }
+
+  async function jikanSeason(year, season, page = 1) {
+    return jikanPage(`/seasons/${year}/${season}?page=${page}&limit=24&sfw=true`);
+  }
+
+  async function jikanAzPage(letter, page = 1, limit = 24) {
+    if (letter === 'All') return jikanPage(`/anime?order_by=title&sort=asc&page=${page}&limit=${limit}&sfw=true`);
+    return jikanPage(`/anime?letter=${encodeURIComponent(letter.toLowerCase())}&order_by=title&sort=asc&page=${page}&limit=${limit}&sfw=true`);
+  }
+
+  // --- Anime by ID (MAL first, fallback AniList) ----------------
   async function animeById(id) {
     let malId = validMalId(id);
     let anilistId = null;
@@ -371,6 +357,17 @@
       malId = null;
     }
     if (!malId && !anilistId) throw new Error('Invalid anime ID');
+    // Try Jikan first for MAL IDs
+    if (malId) {
+      try {
+        const d = await jikanFetch(`/anime/${malId}/full`);
+        const a = normalizeJikan(d.data);
+        if (a) return a;
+      } catch(e) {
+        // fallback to AniList
+      }
+    }
+    // AniList fallback (or primary for anilist- IDs)
     const query = `
       query($idMal:Int, $id:Int) {
         Media(idMal:$idMal, id:$id, type:ANIME) {
@@ -380,9 +377,7 @@
     `;
     const variables = malId ? { idMal: malId } : { id: anilistId };
     const data = await aniListFetch(query, variables);
-    const a = normalizeAniList(data.Media);
-    if (!a) throw new Error('Anime unavailable');
-    return a;
+    return normalizeAniList(data.Media);
   }
 
   // --- URL Helpers ----------------------------------------------
@@ -421,11 +416,11 @@
     return `#/watch/${toSlug(title)}-${id}?ep=${validEpisode(ep) || 1}&track=${validTrack(track) || 'sub'}`;
   }
 
-  function zokoUrl(anilistId, ep, track) {
-    const id = Number(anilistId);
+  function zokoUrl(malId, ep, track) {
+    const id = validMalId(malId);
     const episode = validEpisode(ep);
     const source = validTrack(track) || 'sub';
-    return id && episode ? `${ZOKO_ORIGIN}/stream/ani/${id}/${episode}/${source}?color=35d5bf` : '';
+    return id && episode ? `${ZOKO_ORIGIN}/stream/mal/${id}/${episode}/${source}?color=35d5bf` : '';
   }
 
   // --- UI Components --------------------------------------------
@@ -595,6 +590,16 @@
       ${azSection()}
     `;
 
+    const fillJikan = async (id, promise, emptyMsg, after) => {
+      try {
+        const result = await promise;
+        const items = dedupeAnime(result.items || result);
+        $(id).innerHTML = items.map(card).join('') || empty(emptyMsg);
+        if (after) after(items);
+      } catch(e) {
+        $(id).innerHTML = errorState('Could not load this section.');
+      }
+    };
     const fillAniList = async (id, promise, emptyMsg, after) => {
       try {
         const result = await promise;
@@ -607,13 +612,13 @@
     };
 
     await Promise.all([
-      fillAniList('homeTrending', aniListPage({ sort: ['TRENDING_DESC'], perPage: 12 }), 'No trending anime found.', items => renderHeroSlider(items)),
+      fillJikan('homeTrending', jikanPage('/top/anime?filter=airing&limit=12'), 'No trending anime found.', items => renderHeroSlider(items)),
       fillAniList('homeLatest', aniListPage({ status: 'RELEASING', sort: ['POPULARITY_DESC'], perPage: 18 }), 'No new releases found.'),
       fillAniList('homeTop', aniListPage({ status: 'RELEASING', sort: ['SCORE_DESC'], perPage: 12 }), 'No top airing anime found.'),
-      fillAniList('homePopular', aniListPage({ sort: ['POPULARITY_DESC'], perPage: 18 }), 'No popular anime found.'),
+      fillJikan('homePopular', jikanPage('/top/anime?filter=bypopularity&limit=18'), 'No popular anime found.'),
       fillAniList('homeCompleted', aniListAiringPage(1, 18), 'No latest episodes found.'),
       fillAniList('homeUpcoming', aniListPage({ status: 'NOT_YET_RELEASED', sort: ['POPULARITY_DESC'], perPage: 18 }), 'No upcoming anime found.'),
-      fillAniList('homeRecent', aniListPage({ sort: ['START_DATE_DESC'], perPage: 18 }), 'No recently added anime found.')
+      fillJikan('homeRecent', jikanPage('/anime?order_by=start_date&sort=desc&page=1&limit=18&sfw=true'), 'No recently added anime found.')
     ]);
   }
 
@@ -664,19 +669,16 @@
 
   async function catalogPageData(kind) {
     const q = (state.query || '').trim();
-    if (q) return aniListPage({ search: q, page: state.page, perPage: 24 });
-    if (kind === 'trending') return aniListPage({ sort: ['TRENDING_DESC'], page: state.page, perPage: 24 });
+    if (q) return jikanSearch(q, state.page);
+    if (kind === 'trending') return jikanPage(`/top/anime?filter=airing&page=${state.page}&limit=24`);
     if (kind === 'latest') return aniListPage({ status: 'RELEASING', sort: ['POPULARITY_DESC'], page: state.page, perPage: 24 });
-    if (kind === 'rankings') return aniListPage({ sort: ['POPULARITY_DESC'], page: state.page, perPage: 24 });
-    if (kind === 'recently') return aniListPage({ sort: ['START_DATE_DESC'], page: state.page, perPage: 24 });
+    if (kind === 'rankings') return jikanPage(`/top/anime?filter=bypopularity&page=${state.page}&limit=24`);
+    if (kind === 'recently') return jikanPage(`/anime?order_by=start_date&sort=desc&page=${state.page}&limit=24&sfw=true`);
     if (kind === 'upcoming') return aniListPage({ status: 'NOT_YET_RELEASED', sort: ['POPULARITY_DESC'], page: state.page, perPage: 24 });
-    if (kind === 'genres' && state.genre) {
-      const genre = ANILIST_GENRES[state.genre];
-      return genre ? aniListPage({ genre, sort: ['POPULARITY_DESC'], page: state.page, perPage: 24 }) : { items: [], hasMore: false };
-    }
-    if (kind === 'season') return aniListPage({ season: state.seasonName.toUpperCase(), seasonYear: state.seasonYear, sort: ['POPULARITY_DESC'], page: state.page, perPage: 24 });
-    if (kind === 'az') return jikanAzPage(state.letter || 'All', state.page, 24);
-    return aniListPage({ sort: ['POPULARITY_DESC'], page: state.page, perPage: 24 });
+    if (kind === 'genres' && state.genre) return jikanGenres(state.genre, state.page);
+    if (kind === 'season') return jikanSeason(state.seasonYear, state.seasonName, state.page);
+    if (kind === 'az') return jikanAzPage(state.letter || 'All', state.page);
+    return jikanPage(`/top/anime?filter=bypopularity&page=${state.page}&limit=24`);
   }
 
   async function loadCatalog(kind, append = false) {
@@ -826,7 +828,7 @@
   async function loadRecommendations(a, target) {
     try {
       const recs = (a.relations || [])
-        .filter(r => r.node && (r.node.type === 'ANIME' || r.node.type === 'MANGA'))
+        .filter(r => r.node && r.node.type === 'ANIME')
         .map(r => normalizeAniList(r.node))
         .filter(Boolean)
         .slice(0, 10);
@@ -859,9 +861,10 @@
       prefs.track = state.track;
       writeJson(ANICADE_KEYS.prefs, prefs);
       const title = a.title.english || a.title.romaji;
-      const anilistId = a.aniListId;
-      if (!anilistId) throw new Error('AniList ID missing');
-      const src = zokoUrl(anilistId, state.episode, state.track);
+      // Use MAL ID for streaming
+      const malId = validMalId(a.malId);
+      if (!malId) throw new Error('MAL ID missing');
+      const src = zokoUrl(malId, state.episode, state.track);
       if (!src) throw new Error('Invalid stream URL');
       setMeta(`Watch ${title} - ANICADE`, `Watch ${title} episode ${state.episode} on ANICADE.`, a.cover);
       $('watchPage').innerHTML = `
@@ -871,7 +874,7 @@
               <div class="player-box"><iframe id="anime-player" src="${src}" width="100%" height="500" allow="fullscreen; autoplay" allowfullscreen referrerpolicy="no-referrer-when-downgrade" title="${esc(title)} episode ${state.episode} ${state.track}"></iframe></div>
               <div id="playerMessage" class="player-message">Episode ${state.episode} · ${state.track.toUpperCase()}</div>
               <div class="action-row" style="margin-top:12px">
-                <button class="btn-outline" onclick="saveProgress(${a.malId || a.aniListId}, state.episode, {started:true})"><i class="fas fa-clock"></i> Save Progress</button>
+                <button class="btn-outline" onclick="saveProgress(${malId}, state.episode, {started:true})"><i class="fas fa-clock"></i> Save Progress</button>
                 <a class="btn-outline" href="${animeDetailsLink(a)}"><i class="fas fa-info-circle"></i> Anime Details</a>
               </div>
             </div>
@@ -908,7 +911,7 @@
     document.querySelectorAll('.track-toggle .chip-btn').forEach(b => b.classList.toggle('active', b.textContent.trim().toLowerCase() === track));
   }
   function updateAnimePlayer() {
-    const id = state.currentAnime?.aniListId;
+    const id = validMalId(state.currentAnime?.malId);
     const ep = validEpisode(state.episode);
     const track = validTrack(state.track);
     if (!id || !ep || !track) return;
